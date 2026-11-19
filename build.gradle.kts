@@ -10,7 +10,9 @@ repositories {
 }
 
 dependencies {
+    implementation("dev.kdriver:core:0.6.3")
     testImplementation(kotlin("test"))
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
 }
 
 kotlin {
