@@ -3,6 +3,7 @@ package pl.DropDbLikeItsHard
 
 import dev.kdriver.core.browser.createBrowser
 import dev.kdriver.core.tab.evaluate
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import tools.jackson.databind.ObjectMapper
 import tools.jackson.databind.node.ObjectNode
@@ -14,6 +15,7 @@ import java.net.http.HttpResponse
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
 
 private val mapper = ObjectMapper()
 
@@ -705,15 +707,169 @@ fun savePostJson(
     println("JSON saved: $outputFile")
 }
 
+
 // -----------------------------------------------------------------------------
-// Main
+// Output filename generation
 // -----------------------------------------------------------------------------
+
+fun sanitizeFilenamePart(value: String): String {
+    return value
+        .trim()
+        .replace(Regex("""[\u0000-\u001F<>:"/\\|?*]"""), "_")
+        .replace(Regex("""\s+"""), "_")
+        .replace(Regex("""_+"""), "_")
+        .trim('.', '_', ' ')
+        .take(120)
+}
+
+// -----------------------------------------------------------------------------
+// Filename-generation functions
+// -----------------------------------------------------------------------------
+
+
+fun buildPostFilename(
+    postJson: ObjectNode,
+    statusId: String
+): String {
+    // Extract author username from authorUrl.
+    val authorUrl = postJson.path("authorUrl").asText("")
+
+    val author = runCatching {
+        URI.create(authorUrl)
+            .path
+            .trim('/')
+            .substringAfterLast('/')
+            .removePrefix("@")
+    }.getOrDefault("unknown")
+
+    // Try all available title/text fields.
+    val candidates = listOf(
+        postJson.path("postTitle").asText(""),
+        postJson.path("title").asText(""),
+        postJson.path("text").asText("")
+    ).filter { it.isNotBlank() }
+
+    // Polish, English curly and ordinary quotation marks.
+    val quotationRegex = Regex(
+        """„([^”]+)”|“([^”]+)”|"([^"]+)"|'([^']+)'"""
+    )
+
+    val quotedText = candidates.firstNotNullOfOrNull { candidate ->
+        quotationRegex.find(candidate)
+            ?.groupValues
+            ?.drop(1)
+            ?.firstOrNull { it.isNotBlank() }
+    }
+
+    // If no quotation marks exist, use the actual post text.
+    val filenameText = quotedText
+        ?: postJson.path("text").asText("").ifBlank {
+            candidates.firstOrNull() ?: statusId
+        }
+
+    val safeAuthor = sanitizeFilenamePart(author)
+        .ifBlank { "unknown" }
+
+    val safeTitle = sanitizeFilenamePart(
+        filenameText
+            .trim()
+            .replace(Regex("""[.!?,;:…]+$"""), "")
+    ).ifBlank { statusId }
+
+    return "xcom_${safeAuthor}_${safeTitle}.json"
+}
+
+
+// -----------------------------------------------------------------------------
+// Browser readiness
+// -----------------------------------------------------------------------------
+
+suspend fun waitForPageReady(
+    evaluate: suspend (String) -> String,
+    timeoutMs: Long = 30_000
+) {
+    val started = System.currentTimeMillis()
+
+    val script = """
+        (() => {
+            const article = document.querySelector('article');
+            const title = document.querySelector(
+                'meta[property="og:title"]'
+            )?.content;
+
+            return article && title ? 'READY' : 'WAIT';
+        })()
+    """.trimIndent()
+
+    while (System.currentTimeMillis() - started < timeoutMs) {
+        if (evaluate(script) == "READY") {
+            println("Post page is ready.")
+            return
+        }
+
+        delay(500.milliseconds)
+    }
+
+    throw RuntimeException(
+        "Post page did not become ready within ${timeoutMs}ms"
+    )
+}
+
+suspend fun waitForVideoResources(
+    evaluate: suspend (String) -> String,
+    timeoutMs: Long = 20_000
+) {
+    val started = System.currentTimeMillis()
+
+    val script = """
+        (() => {
+            const article = document.querySelector('article');
+            const video = article?.querySelector('video');
+
+            if (!video) {
+                return 'READY';
+            }
+
+            const resources = performance
+                .getEntriesByType('resource')
+                .map(entry => entry.name);
+
+            const hasHls = resources.some(url =>
+                url.includes('video.twimg.com') &&
+                /\.m3u8(\?|$)/i.test(url)
+            );
+
+            const hasMp4 =
+                /\.mp4(\?|$)/i.test(video.currentSrc || '') ||
+                [...video.querySelectorAll('source')]
+                    .some(source => /\.mp4(\?|$)/i.test(source.src));
+
+            return hasHls || hasMp4 ? 'READY' : 'WAIT';
+        })()
+    """.trimIndent()
+
+    while (System.currentTimeMillis() - started < timeoutMs) {
+        if (evaluate(script) == "READY") {
+            println("Video resources are ready.")
+            return
+        }
+
+        delay(500)
+    }
+
+    println(
+        "Warning: video resource detection timed out. " +
+                "Continuing with the available resources."
+    )
+}
+
+
 
 fun main() = runBlocking {
 
     // The post URL is defined only once.
     val postUrl =
-        "https://x.com/Music/status/2123156565587005790"
+        "https://x.com/hackathons/status/903672606733340674"
 
     val statusId = Regex("/status/(\\d+)")
         .find(postUrl)
@@ -725,7 +881,7 @@ fun main() = runBlocking {
 
     val website = uri.host
         .removePrefix("www.")
-        .replace(".", "_")
+        .replace(".", "")
 
     val postDirectory = Path.of(
         "output",
@@ -733,67 +889,93 @@ fun main() = runBlocking {
         statusId
     )
 
-    val jsonFile = postDirectory.resolve(
-        "xcom-status-$statusId.json"
-    )
-
     val resourceDirectory = postDirectory.resolve("resources")
 
     Files.createDirectories(postDirectory)
     Files.createDirectories(resourceDirectory)
 
-    // -------------------------------------------------------------------------
-    // 1. Open browser and extract metadata only.
-    // -------------------------------------------------------------------------
+    val browser = createBrowser(this)
 
-    val postJson = run {
-        val browser = createBrowser(this)
+    try {
+        // ---------------------------------------------------------------------
+        // 1. Open the post.
+        // ---------------------------------------------------------------------
 
-        try {
-            val page = browser.get(postUrl)
+        val page = browser.get(postUrl)
 
-            // Allow the post and its video player to load.
-            page.wait(3000)
-
-            // Trigger the HLS requests.
-            val activationResult = activateVideo { js ->
+        waitForPageReady(
+            evaluate = { js ->
                 page.evaluate<String>(js)!!
             }
+        )
 
-            println(activationResult)
+        // ---------------------------------------------------------------------
+        // 2. Activate the video and wait for its playlist requests.
+        // ---------------------------------------------------------------------
 
-            // Give the browser a moment to request the playlists.
-            page.wait(2000)
-
-            // Extract metadata and resource URLs.
-            val extractedJson = extractPost { js ->
-                page.evaluate<String>(js)!!
-            }
-
-            mapper.readTree(extractedJson) as ObjectNode
-
-        } finally {
-            // Browser is closed BEFORE any resource downloads begin.
-            browser.stop()
-            println("Browser closed.")
+        val activationResult = activateVideo { js ->
+            page.evaluate<String>(js)!!
         }
+
+        println(activationResult)
+
+        waitForVideoResources(
+            evaluate = { js ->
+                page.evaluate<String>(js)!!
+            }
+        )
+
+        // ---------------------------------------------------------------------
+        // 3. Extract post metadata and resource URLs.
+        // ---------------------------------------------------------------------
+
+        val extractedJson = extractPost { js ->
+            page.evaluate<String>(js)!!
+        }
+
+        val postJson = mapper.readTree(extractedJson) as ObjectNode
+
+        // ---------------------------------------------------------------------
+        // 4. Generate the JSON filename from author and quoted post title.
+        // ---------------------------------------------------------------------
+
+        /// debug prints
+        println("Post title: ${postJson.path("postTitle").asText()}")
+        println("Document title: ${postJson.path("title").asText()}")
+        println("Post text: ${postJson.path("text").asText()}")
+        println("Author URL: ${postJson.path("authorUrl").asText()}")
+
+        val jsonFilename = buildPostFilename(
+            postJson,
+            statusId
+        )
+
+        val jsonFile = postDirectory.resolve(jsonFilename)
+
+        println("Output JSON: $jsonFile")
+
+        // ---------------------------------------------------------------------
+        // 5. Download resources while the browser remains open.
+        // ---------------------------------------------------------------------
+
+        downloadResources(
+            postJson,
+            resourceDirectory
+        )
+
+        // ---------------------------------------------------------------------
+        // 6. Save JSON with the downloaded file paths.
+        // ---------------------------------------------------------------------
+
+        savePostJson(
+            postJson,
+            jsonFile
+        )
+
+    } finally {
+        // Browser closes only after downloads and JSON saving finish.
+        browser.stop()
+        println("Browser closed.")
     }
-
-    // -------------------------------------------------------------------------
-    // 2. Download images, HLS playlists, video and audio.
-    // -------------------------------------------------------------------------
-
-    downloadResources(
-        postJson,
-        resourceDirectory
-    )
-
-    // -------------------------------------------------------------------------
-    // 3. Save JSON with local file paths.
-    // -------------------------------------------------------------------------
-
-    savePostJson(
-        postJson,
-        jsonFile
-    )
 }
+
