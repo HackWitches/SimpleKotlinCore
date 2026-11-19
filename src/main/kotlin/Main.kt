@@ -167,7 +167,7 @@ suspend fun activateVideo(
 fun getBytes(uri: URI): ByteArray {
     val request = HttpRequest.newBuilder()
         .uri(uri)
-        .header("User-Agent", "Mozilla/5.0")
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:160.0) Gecko/20100101 Firefox/160.0")
         .header("Referer", "https://x.com/")
         .header("Origin", "https://x.com")
         .header("Accept", "*/*")
@@ -869,7 +869,7 @@ fun main() = runBlocking {
 
     // The post URL is defined only once.
     val postUrl =
-        "https://x.com/hackathons/status/903672606733340674"
+        "https://x.com/TheUnitedSpot__/status/2118874165570887940"
 
     val statusId = Regex("/status/(\\d+)")
         .find(postUrl)
